@@ -1,5 +1,5 @@
 {
-  "name": "FileShare",
+  "name": "Lightning Share",
   "description": "Lightning-fast Android file sharing app connecting to local TCP servers.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

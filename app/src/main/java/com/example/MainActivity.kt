@@ -16,227 +16,164 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.IBinder
 import android.os.SystemClock
-import android.provider.OpenableColumns
+import android.provider.Settings
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.List
-import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Apps
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Computer
+import androidx.compose.material.icons.filled.Explore
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.toBitmap
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.theme.MyApplicationTheme
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import org.json.JSONObject
 import java.io.*
 import java.net.*
-import java.nio.channels.Channels
+import java.util.UUID
 import kotlin.coroutines.coroutineContext
 
-data class AppInfo(val name: String, val packageName: String, val apkPath: String, val icon: Drawable)
+// --- Models ---
+data class AppItem(val name: String, val packageName: String, val apkPath: String, val size: Long, val icon: Drawable?)
+data class FileItem(val file: File, val isDirectory: Boolean, val name: String, val size: Long)
+data class DiscoveredDevice(val name: String, val ip: String, val port: Int, val lastSeen: Long)
+data class TransferJob(
+    val id: String,
+    val targetIp: String,
+    val filename: String,
+    val progress: Float,
+    val speedMbps: Float,
+    val state: TransferState
+)
+enum class TransferState { PENDING, TRANSFERRING, SUCCESS, ERROR, DISCONNECTED }
 
-sealed class TransferState {
-    object Idle : TransferState()
-    data class Transferring(val filename: String, val progress: Float, val speed: Float, val isResume: Boolean) : TransferState()
-    data class Disconnected(val filename: String, val progress: Float, val sentBytes: Long, val totalBytes: Long) : TransferState()
-    data class Success(val filename: String) : TransferState()
-    data class Error(val message: String) : TransferState()
-}
+data class SendTask(
+    val path: String,
+    val filename: String,
+    val size: Long
+)
 
+// --- Global Manager ---
 object TransferManager {
-    val senderState = MutableStateFlow<TransferState>(TransferState.Idle)
-    val receiverState = MutableStateFlow<TransferState>(TransferState.Idle)
+    private val _transfers = MutableStateFlow<List<TransferJob>>(emptyList())
+    val transfers: StateFlow<List<TransferJob>> = _transfers.asStateFlow()
     
-    var currentSendJob: Job? = null
-    var receiverJob: Job? = null
+    val pendingTasks = mutableListOf<SendTask>()
+    var selectedDevice: DiscoveredDevice? = null
+
+    fun updateTransfer(id: String, mutate: (TransferJob) -> TransferJob) {
+        _transfers.update { list ->
+            val index = list.indexOfFirst { it.id == id }
+            if (index != -1) {
+                val updatedList = list.toMutableList()
+                updatedList[index] = mutate(updatedList[index])
+                updatedList
+            } else {
+                list
+            }
+        }
+    }
     
-    var lastTargetIp = ""
-    var lastTargetPort = 9999
-    var lastFileUri: Uri? = null
-    var lastApkPath: String? = null
-    var lastFilename = ""
-    var lastFilesize = 0L
+    fun addTransfer(job: TransferJob) {
+        _transfers.update { it + job }
+    }
 }
 
+// --- Foreground Service ---
 class TransferService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action
-        if (action == "START_RECEIVER") {
-            val port = intent.getIntExtra("port", 9999)
-            if (TransferManager.receiverJob?.isActive == true) return START_STICKY
-            startForegroundCompat(1, createNotification("LightningShare Receiver", "Listening on port $port"))
-            TransferManager.receiverJob = serviceScope.launch {
-                startReceiver(port)
-            }
-        } else if (action == "STOP_RECEIVER") {
-            TransferManager.receiverJob?.cancel()
-            TransferManager.receiverState.value = TransferState.Idle
-            stopSelf()
-        } else if (action == "START_SENDER" || action == "RESUME_SENDER") {
-            val isResume = action == "RESUME_SENDER"
-            startForegroundCompat(2, createNotification("LightningShare Sender", "Transferring..."))
-            TransferManager.currentSendJob?.cancel()
-            TransferManager.currentSendJob = serviceScope.launch {
-                sendFile(
-                    ip = TransferManager.lastTargetIp,
-                    port = TransferManager.lastTargetPort,
-                    uri = TransferManager.lastFileUri,
-                    apkPath = TransferManager.lastApkPath,
-                    filename = TransferManager.lastFilename,
-                    filesize = TransferManager.lastFilesize,
-                    actionStr = if (isResume) "RESUME" else "NEW"
-                )
+        if (intent?.action == "START_TRANSFER") {
+            startForegroundCompat(3, createNotification("Lightning Share", "Sending files..."))
+            
+            val tasks = TransferManager.pendingTasks.toList()
+            val targetDevice = TransferManager.selectedDevice
+            
+            TransferManager.pendingTasks.clear()
+            
+            if (tasks.isNotEmpty() && targetDevice != null) {
+                serviceScope.launch {
+                    for (task in tasks) {
+                        val jobId = UUID.randomUUID().toString()
+                        val job = TransferJob(
+                            id = jobId,
+                            targetIp = targetDevice.ip,
+                            filename = task.filename,
+                            progress = 0f,
+                            speedMbps = 0f,
+                            state = TransferState.PENDING
+                        )
+                        TransferManager.addTransfer(job)
+                        
+                        sendFileToDevice(targetDevice.ip, targetDevice.port, task, jobId)
+                    }
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            } else {
+                stopSelf()
             }
         }
         return START_STICKY
     }
 
-    private fun startForegroundCompat(id: Int, notification: Notification) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(id, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } else {
-            startForeground(id, notification)
-        }
-    }
-
-    private fun createNotification(title: String, text: String): Notification {
-        val channelId = "transfer_channel"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "File Transfers", NotificationManager.IMPORTANCE_LOW)
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
-        return NotificationCompat.Builder(this, channelId)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .build()
-    }
-
-    private suspend fun startReceiver(port: Int) {
-        var serverSocket: ServerSocket? = null
-        try {
-            serverSocket = ServerSocket(port)
-            TransferManager.receiverState.value = TransferState.Idle
-            while (coroutineContext.isActive) {
-                val client = serverSocket.accept()
-                serviceScope.launch { handleClient(client) }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        } finally {
-            serverSocket?.close()
-        }
-    }
-
-    private suspend fun handleClient(socket: Socket) {
-        try {
-            socket.tcpNoDelay = true
-            socket.receiveBufferSize = 1 * 1024 * 1024
-            val input = socket.getInputStream()
-            val output = socket.getOutputStream()
-            
-            val reader = BufferedReader(InputStreamReader(input))
-            val header = reader.readLine() ?: return
-            val json = JSONObject(header)
-            val filename = json.getString("filename")
-            val action = json.optString("action", "NEW")
-            
-            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            val lightningDir = File(downloadsDir, "LightningShare")
-            lightningDir.mkdirs()
-            
-            val targetFile = File(lightningDir, filename)
-            var startOffset = 0L
-            if (action == "RESUME" && targetFile.exists()) {
-                startOffset = targetFile.length()
-            } else if (action == "NEW") {
-                if (targetFile.exists()) targetFile.delete()
-                targetFile.createNewFile()
-            }
-            
-            output.write("$startOffset\n".toByteArray(Charsets.UTF_8))
-            output.flush()
-            
-            val raf = RandomAccessFile(targetFile, "rw")
-            raf.seek(startOffset)
-            
-            var totalRead = startOffset
-            val buffer = ByteArray(64 * 1024)
-            var bytesRead: Int
-            val startTime = SystemClock.elapsedRealtime()
-            var lastReportTime = startTime
-            var bytesSinceLastReport = 0L
-            
-            while (input.read(buffer).also { bytesRead = it } != -1) {
-                raf.write(buffer, 0, bytesRead)
-                totalRead += bytesRead
-                bytesSinceLastReport += bytesRead
-                
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastReportTime >= 500) {
-                    val speed = (bytesSinceLastReport / 1024f / 1024f) / ((now - lastReportTime) / 1000f)
-                    TransferManager.receiverState.value = TransferState.Transferring(filename, 0f, speed, action == "RESUME")
-                    lastReportTime = now
-                    bytesSinceLastReport = 0L
-                }
-            }
-            raf.close()
-            
-            output.write("SUCCESS\n".toByteArray(Charsets.UTF_8))
-            output.flush()
-            
-            TransferManager.receiverState.value = TransferState.Success(filename)
-            socket.close()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        } finally {
-            socket.close()
-        }
-    }
-
-    private suspend fun sendFile(ip: String, port: Int, uri: Uri?, apkPath: String?, filename: String, filesize: Long, actionStr: String) {
+    private suspend fun sendFileToDevice(ip: String, port: Int, task: SendTask, jobId: String) {
         var socket: Socket? = null
         var totalRead = 0L
         try {
-            TransferManager.senderState.value = TransferState.Transferring(filename, 0f, 0f, actionStr == "RESUME")
+            TransferManager.updateTransfer(jobId) { it.copy(state = TransferState.TRANSFERRING) }
+            
             socket = Socket()
             socket.tcpNoDelay = true
-            socket.sendBufferSize = 1 * 1024 * 1024
+            socket.sendBufferSize = 4 * 1024 * 1024
             socket.connect(InetSocketAddress(ip, port), 10000)
             
             val output = socket.getOutputStream()
             val input = socket.getInputStream()
             
             val json = JSONObject()
-            json.put("filename", filename)
-            json.put("action", actionStr)
+            json.put("filename", task.filename)
+            json.put("action", "NEW")
             val headerString = json.toString() + "\n"
             output.write(headerString.toByteArray(Charsets.UTF_8))
             output.flush()
@@ -246,22 +183,15 @@ class TransferService : Service() {
             val startOffset = responseOffsetStr?.toLongOrNull() ?: 0L
             totalRead = startOffset
             
-            val buffer = ByteArray(64 * 1024)
+            val buffer = ByteArray(1 * 1024 * 1024)
             var bytesRead: Int
             val startTime = SystemClock.elapsedRealtime()
             var lastReportTime = startTime
             var bytesSinceLastReport = 0L
             
-            val fileStream: InputStream = if (apkPath != null) {
-                val raf = RandomAccessFile(apkPath, "r")
-                raf.seek(startOffset)
-                Channels.newInputStream(raf.channel)
-            } else if (uri != null) {
-                val pfd = contentResolver.openFileDescriptor(uri, "r") ?: throw Exception("PFD null")
-                val fis = FileInputStream(pfd.fileDescriptor)
-                fis.channel.position(startOffset)
-                fis
-            } else throw Exception("No file source")
+            val raf = RandomAccessFile(task.path, "r")
+            raf.seek(startOffset)
+            val fileStream = java.nio.channels.Channels.newInputStream(raf.channel)
             
             fileStream.use { stream ->
                 while (stream.read(buffer).also { bytesRead = it } != -1) {
@@ -273,41 +203,202 @@ class TransferService : Service() {
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastReportTime >= 500) {
                         val speed = (bytesSinceLastReport / 1024f / 1024f) / ((now - lastReportTime) / 1000f)
-                        val progress = if (filesize > 0) totalRead.toFloat() / filesize else 0f
-                        TransferManager.senderState.value = TransferState.Transferring(filename, progress, speed, actionStr == "RESUME")
+                        val progress = if (task.size > 0) totalRead.toFloat() / task.size else 0f
+                        TransferManager.updateTransfer(jobId) { it.copy(progress = progress, speedMbps = speed) }
                         lastReportTime = now
                         bytesSinceLastReport = 0L
                     }
                 }
             }
             
-            // Wait for SUCCESS from server
             socket.shutdownOutput()
-            val responseChar = input.read()
+            input.read() // Wait for SUCCESS
             
-            TransferManager.senderState.value = TransferState.Success(filename)
-            socket.close()
+            TransferManager.updateTransfer(jobId) { it.copy(progress = 1f, speedMbps = 0f, state = TransferState.SUCCESS) }
         } catch (e: Exception) {
             e.printStackTrace()
-            if (e is SocketException || e is IOException) {
-                val progress = if (filesize > 0) totalRead.toFloat() / filesize else 0f
-                TransferManager.senderState.value = TransferState.Disconnected(filename, progress, totalRead, filesize)
-            } else {
-                TransferManager.senderState.value = TransferState.Error(e.message ?: "Unknown error")
-            }
+            val state = if (e is SocketException || e is IOException) TransferState.DISCONNECTED else TransferState.ERROR
+            TransferManager.updateTransfer(jobId) { it.copy(state = state) }
         } finally {
             socket?.close()
-            stopSelf()
         }
+    }
+
+    private fun startForegroundCompat(id: Int, notification: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(id, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(id, notification)
+        }
+    }
+
+    private fun createNotification(title: String, text: String): Notification {
+        val channelId = "lightning_share_channel"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(channelId, "File Transfers", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        }
+        return NotificationCompat.Builder(this, channelId)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .build()
     }
 }
 
+// --- ViewModels ---
+class MainViewModel : ViewModel() {
+    // Selection state
+    val selectedFiles = mutableStateListOf<File>()
+    val selectedApps = mutableStateListOf<AppItem>()
+    
+    // Files Tab
+    var currentPath by mutableStateOf(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS))
+    var filesInCurrentPath by mutableStateOf<List<FileItem>>(emptyList())
+    var fileSearchQuery by mutableStateOf("")
+    
+    // Apps Tab
+    var installedApps by mutableStateOf<List<AppItem>>(emptyList())
+    var appSearchQuery by mutableStateOf("")
+    
+    // Discover Tab
+    private val _discoveredDevices = MutableStateFlow<List<DiscoveredDevice>>(emptyList())
+    val discoveredDevices: StateFlow<List<DiscoveredDevice>> = _discoveredDevices.asStateFlow()
+    var isVisible by mutableStateOf(true)
+    var deviceName by mutableStateOf(Build.MODEL)
+    var localIp by mutableStateOf("")
+    
+    // Broadcast / Discovery Socket
+    private var discoverySocket: DatagramSocket? = null
+    private var discoveryJob: Job? = null
+    private var broadcastJob: Job? = null
+    
+    init {
+        localIp = getLocalIpAddress()
+    }
+    
+    fun startDiscovery() {
+        if (discoveryJob?.isActive == true) return
+        
+        discoveryJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                if (discoverySocket == null || discoverySocket?.isClosed == true) {
+                    discoverySocket = DatagramSocket(null).apply {
+                        reuseAddress = true
+                        bind(InetSocketAddress(8888))
+                        broadcast = true
+                    }
+                }
+                val buffer = ByteArray(1024)
+                while (isActive) {
+                    val packet = java.net.DatagramPacket(buffer, buffer.size)
+                    discoverySocket?.receive(packet)
+                    val data = String(packet.data, 0, packet.length, Charsets.UTF_8)
+                    try {
+                        val json = JSONObject(data)
+                        val name = json.getString("device_name")
+                        val ip = json.getString("ip")
+                        val port = json.getInt("port")
+                        
+                        if (ip != localIp) { // Ignore self
+                            val newDevice = DiscoveredDevice(name, ip, port, System.currentTimeMillis())
+                            _discoveredDevices.update { list ->
+                                val filtered = list.filter { it.ip != ip }
+                                (filtered + newDevice).sortedByDescending { it.lastSeen }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+        
+        broadcastJob = viewModelScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                if (isVisible && localIp.isNotEmpty() && localIp != "Not found") {
+                    try {
+                        val json = JSONObject()
+                        json.put("device_name", deviceName)
+                        json.put("ip", localIp)
+                        json.put("port", 9999) // TCP listening port if we had a receiver component
+                        val data = json.toString().toByteArray(Charsets.UTF_8)
+                        
+                        // Send broadcast
+                        val broadcastAddress = InetAddress.getByName("255.255.255.255")
+                        val packet = DatagramPacket(data, data.size, broadcastAddress, 8888)
+                        val sock = DatagramSocket()
+                        sock.broadcast = true
+                        sock.send(packet)
+                        sock.close()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+                delay(2000) // Broadcast every 2s
+            }
+        }
+    }
+    
+    fun stopDiscovery() {
+        discoveryJob?.cancel()
+        broadcastJob?.cancel()
+        discoverySocket?.close()
+        discoverySocket = null
+        discoveryJob = null
+        broadcastJob = null
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        stopDiscovery()
+    }
+    
+    fun loadFiles(path: File) {
+        currentPath = path
+        val list = path.listFiles()?.toList() ?: emptyList()
+        filesInCurrentPath = list.map { 
+            FileItem(it, it.isDirectory, it.name, it.length())
+        }.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+    }
+    
+    fun toggleFileSelection(file: File) {
+        if (selectedFiles.contains(file)) selectedFiles.remove(file)
+        else selectedFiles.add(file)
+    }
+    
+    fun toggleAppSelection(app: AppItem) {
+        if (selectedApps.contains(app)) selectedApps.remove(app)
+        else selectedApps.add(app)
+    }
+    
+    private fun getLocalIpAddress(): String {
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            for (intf in interfaces) {
+                val addrs = intf.inetAddresses
+                for (addr in addrs) {
+                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                        return addr.hostAddress ?: ""
+                    }
+                }
+            }
+        } catch (ex: Exception) {}
+        return "Not found"
+    }
+}
+
+// --- UI Activity ---
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
         val permissions = mutableListOf(
             Manifest.permission.INTERNET,
+            Manifest.permission.ACCESS_NETWORK_STATE,
+            Manifest.permission.ACCESS_WIFI_STATE,
             Manifest.permission.READ_EXTERNAL_STORAGE,
             Manifest.permission.WRITE_EXTERNAL_STORAGE
         )
@@ -317,239 +408,445 @@ class MainActivity : ComponentActivity() {
             permissions.add(Manifest.permission.READ_MEDIA_VIDEO)
             permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            try {
+                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                intent.data = Uri.parse("package:" + packageName)
+                // startActivity(intent)
+            } catch (e: Exception) {
+            }
+        }
         ActivityCompat.requestPermissions(this, permissions.toTypedArray(), 1)
 
         enableEdgeToEdge()
         setContent {
-            MyApplicationTheme {
-                MainScreen()
+            MyApplicationTheme(darkTheme = true) {
+                LightningShareApp()
             }
         }
     }
-}
-
-fun getFileInfo(context: Context, uri: Uri): Pair<String, Long> {
-    var name = "unknown_file"
-    var size = 0L
-    context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-        val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-        if (cursor.moveToFirst()) {
-            if (nameIndex != -1) name = cursor.getString(nameIndex)
-            if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
-        }
-    }
-    return Pair(name, size)
-}
-
-fun getInstalledApps(context: Context): List<AppInfo> {
-    val pm = context.packageManager
-    val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
-    return apps.filter { (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 }
-        .map {
-            AppInfo(
-                name = pm.getApplicationLabel(it).toString(),
-                packageName = it.packageName,
-                apkPath = it.sourceDir,
-                icon = pm.getApplicationIcon(it)
-            )
-        }
-}
-
-fun getLocalIpAddress(): String {
-    try {
-        val interfaces = NetworkInterface.getNetworkInterfaces()
-        for (intf in interfaces) {
-            val addrs = intf.inetAddresses
-            for (addr in addrs) {
-                if (!addr.isLoopbackAddress && addr is Inet4Address) {
-                    return addr.hostAddress ?: ""
-                }
-            }
-        }
-    } catch (ex: Exception) {}
-    return "Not found"
-}
-
-fun startSendIntent(context: Context, ip: String, port: Int, uri: Uri?, apkPath: String?, filename: String, filesize: Long, isResume: Boolean = false) {
-    TransferManager.lastTargetIp = ip
-    TransferManager.lastTargetPort = port
-    TransferManager.lastFileUri = uri
-    TransferManager.lastApkPath = apkPath
-    TransferManager.lastFilename = filename
-    TransferManager.lastFilesize = filesize
-    
-    val intent = Intent(context, TransferService::class.java).apply {
-        action = if (isResume) "RESUME_SENDER" else "START_SENDER"
-    }
-    ContextCompat.startForegroundService(context, intent)
 }
 
 @Composable
-fun MainScreen() {
+fun LightningShareApp(viewModel: MainViewModel = viewModel()) {
     var selectedTab by remember { mutableIntStateOf(0) }
+    val context = LocalContext.current
+    
+    LaunchedEffect(Unit) {
+        viewModel.loadFiles(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS))
+        withContext(Dispatchers.IO) {
+            val pm = context.packageManager
+            val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+            val filtered = apps.filter { (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 }
+            viewModel.installedApps = filtered.map {
+                AppItem(
+                    name = pm.getApplicationLabel(it).toString(),
+                    packageName = it.packageName,
+                    apkPath = it.sourceDir,
+                    size = File(it.sourceDir).length(),
+                    icon = pm.getApplicationIcon(it)
+                )
+            }.sortedBy { it.name.lowercase() }
+        }
+    }
+    
+    DisposableEffect(selectedTab) {
+        if (selectedTab == 0) {
+            viewModel.startDiscovery()
+        } else {
+            viewModel.stopDiscovery()
+        }
+        onDispose {
+            viewModel.stopDiscovery()
+        }
+    }
     
     Scaffold(
+        topBar = {
+            @OptIn(ExperimentalMaterial3Api::class)
+            TopAppBar(
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.foundation.Image(
+                            painter = androidx.compose.ui.res.painterResource(R.drawable.lightning_share_icon_1782480629924),
+                            contentDescription = "Logo",
+                            modifier = Modifier.size(40.dp).padding(end = 8.dp)
+                        )
+                        Text("Lightning Share")
+                    }
+                }
+            )
+        },
         bottomBar = {
             NavigationBar {
                 NavigationBarItem(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },
-                    icon = { Icon(Icons.AutoMirrored.Filled.Send, "Send Files") },
-                    label = { Text("Send Files") }
+                    icon = { Icon(Icons.Default.Explore, "Discover") },
+                    label = { Text("Discover") }
                 )
                 NavigationBarItem(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
-                    icon = { Icon(Icons.Default.List, "Send Apps") },
-                    label = { Text("Send Apps") }
+                    icon = { Icon(Icons.Default.Folder, "Files") },
+                    label = { Text("Files") }
                 )
                 NavigationBarItem(
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 },
-                    icon = { Icon(Icons.Default.Settings, "Receiver") },
-                    label = { Text("Receiver Status") }
+                    icon = { Icon(Icons.Default.Apps, "Apps") },
+                    label = { Text("Apps") }
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 3,
+                    onClick = { selectedTab = 3 },
+                    icon = { Icon(Icons.Default.Person, "Me") },
+                    label = { Text("Me") }
                 )
             }
         }
     ) { innerPadding ->
-        Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
+        Box(modifier = Modifier.padding(innerPadding).fillMaxSize().background(MaterialTheme.colorScheme.background)) {
             when (selectedTab) {
-                0 -> SendFilesTab()
-                1 -> SendAppsTab()
-                2 -> ReceiverTab()
+                0 -> DiscoverTab(viewModel)
+                1 -> FilesTab(viewModel)
+                2 -> AppsTab(viewModel)
+                3 -> MeTab(viewModel)
+            }
+            
+            AnimatedVisibility(
+                visible = selectedTab == 1 && viewModel.selectedFiles.isNotEmpty(),
+                modifier = Modifier.align(Alignment.BottomCenter)
+            ) {
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer,
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    shape = MaterialTheme.shapes.medium,
+                    shadowElevation = 4.dp
+                ) {
+                    Row(
+                        modifier = Modifier.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("${viewModel.selectedFiles.size} selected", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                        Button(onClick = {
+                            viewModel.selectedFiles.forEach { file ->
+                                TransferManager.pendingTasks.add(SendTask(file.absolutePath, file.name, file.length()))
+                            }
+                            viewModel.selectedFiles.clear()
+                            selectedTab = 0 
+                        }) {
+                            Text("Send to...")
+                        }
+                    }
+                }
+            }
+            
+            AnimatedVisibility(
+                visible = selectedTab == 2 && viewModel.selectedApps.isNotEmpty(),
+                modifier = Modifier.align(Alignment.BottomCenter)
+            ) {
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer,
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    shape = MaterialTheme.shapes.medium,
+                    shadowElevation = 4.dp
+                ) {
+                    Row(
+                        modifier = Modifier.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("${viewModel.selectedApps.size} selected", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                        Button(onClick = {
+                            viewModel.selectedApps.forEach { app ->
+                                TransferManager.pendingTasks.add(SendTask(app.apkPath, "${app.name}.apk", app.size))
+                            }
+                            viewModel.selectedApps.clear()
+                            selectedTab = 0 
+                        }) {
+                            Text("Send to...")
+                        }
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-fun SendFilesTab() {
-    val context = LocalContext.current
-    var ip by remember { mutableStateOf("192.168.1.50") }
-    var port by remember { mutableStateOf("9999") }
-    val senderState by TransferManager.senderState.collectAsState()
+fun RadarAnimation() {
+    val infiniteTransition = rememberInfiniteTransition()
+    val scale by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 3f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        )
+    )
+    val alpha by infiniteTransition.animateFloat(
+        initialValue = 1f,
+        targetValue = 0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        )
+    )
     
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null) {
-            val (name, size) = getFileInfo(context, uri)
-            startSendIntent(context, ip, port.toIntOrNull() ?: 9999, uri, null, name, size)
+    val primaryColor = MaterialTheme.colorScheme.primary
+    
+    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(200.dp)) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            drawCircle(
+                color = primaryColor.copy(alpha = alpha),
+                radius = size.width / 2 * scale,
+                style = Stroke(width = 4f)
+            )
         }
+        androidx.compose.foundation.Image(
+            painter = androidx.compose.ui.res.painterResource(R.drawable.lightning_share_icon_1782480629924),
+            contentDescription = "App Logo",
+            modifier = Modifier.size(64.dp)
+        )
     }
+}
+
+@Composable
+fun DiscoverTab(viewModel: MainViewModel) {
+    val devices by viewModel.discoveredDevices.collectAsState()
+    val context = LocalContext.current
+    val transfers by TransferManager.transfers.collectAsState()
     
-    Column(Modifier.padding(16.dp)) {
-        OutlinedTextField(value = ip, onValueChange = { ip = it }, label = { Text("Target IP") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(value = port, onValueChange = { port = it }, label = { Text("Target Port") }, modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
-        Spacer(Modifier.height(16.dp))
-        Button(onClick = { launcher.launch("*/*") }, modifier = Modifier.fillMaxWidth()) {
-            Text("Select File to Send")
+    Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(32.dp))
+        RadarAnimation()
+        Spacer(Modifier.height(32.dp))
+        
+        Text("Listening for devices...", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        
+        LazyColumn(Modifier.fillMaxWidth().weight(1f).padding(16.dp)) {
+            items(devices) { device ->
+                Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                    Row(
+                        modifier = Modifier.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.Computer, contentDescription = null, modifier = Modifier.size(40.dp), tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(16.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(device.name, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                            Text(device.ip, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        
+                        if (TransferManager.pendingTasks.isNotEmpty()) {
+                            Button(onClick = {
+                                TransferManager.selectedDevice = device
+                                val intent = Intent(context, TransferService::class.java).apply {
+                                    action = "START_TRANSFER"
+                                }
+                                ContextCompat.startForegroundService(context, intent)
+                            }) {
+                                Text("Connect & Send")
+                            }
+                        }
+                    }
+                }
+            }
         }
-        Spacer(Modifier.height(16.dp))
-        TransferStatusCard(senderState) {
-            val intent = Intent(context, TransferService::class.java).apply { action = "RESUME_SENDER" }
-            ContextCompat.startForegroundService(context, intent)
+        
+        if (transfers.isNotEmpty()) {
+            Text("Active Transfers", fontWeight = FontWeight.Bold, modifier = Modifier.padding(8.dp))
+            LazyColumn(Modifier.fillMaxWidth().weight(1f).padding(horizontal = 16.dp)) {
+                items(transfers.filter { it.state != TransferState.SUCCESS }) { job ->
+                    Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text("${job.targetIp} - ${job.filename}", fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(4.dp))
+                            LinearProgressIndicator(progress = { job.progress }, modifier = Modifier.fillMaxWidth())
+                            Spacer(Modifier.height(4.dp))
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text(job.state.name, fontSize = 12.sp, color = when(job.state) {
+                                    TransferState.SUCCESS -> Color(0xFF00C853)
+                                    TransferState.ERROR, TransferState.DISCONNECTED -> Color.Red
+                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                })
+                                if (job.state == TransferState.TRANSFERRING) {
+                                    Text(String.format("%.2f MB/s", job.speedMbps), fontSize = 12.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
 @Composable
-fun SendAppsTab() {
-    val context = LocalContext.current
-    var ip by remember { mutableStateOf("192.168.1.50") }
-    var port by remember { mutableStateOf("9999") }
-    val senderState by TransferManager.senderState.collectAsState()
-    
-    var apps by remember { mutableStateOf(emptyList<AppInfo>()) }
-    LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
-            apps = getInstalledApps(context)
-        }
+fun FilesTab(viewModel: MainViewModel) {
+    val filteredFiles = viewModel.filesInCurrentPath.filter { 
+        viewModel.fileSearchQuery.isEmpty() || it.name.contains(viewModel.fileSearchQuery, ignoreCase = true)
     }
     
-    Column(Modifier.padding(16.dp)) {
-        OutlinedTextField(value = ip, onValueChange = { ip = it }, label = { Text("Target IP") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(value = port, onValueChange = { port = it }, label = { Text("Target Port") }, modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
+    Column(Modifier.fillMaxSize()) {
+        OutlinedTextField(
+            value = viewModel.fileSearchQuery,
+            onValueChange = { viewModel.fileSearchQuery = it },
+            placeholder = { Text("Search local files") },
+            leadingIcon = { Icon(Icons.Default.Search, null) },
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            singleLine = true
+        )
         
-        TransferStatusCard(senderState) {
-            val intent = Intent(context, TransferService::class.java).apply { action = "RESUME_SENDER" }
-            ContextCompat.startForegroundService(context, intent)
+        LazyRow(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            val chips = listOf("Downloads", "Documents", "DCIM", "Movies")
+            items(chips) { chip ->
+                FilterChip(
+                    selected = false,
+                    onClick = {
+                        val dir = Environment.getExternalStoragePublicDirectory(chip)
+                        if (dir.exists()) viewModel.loadFiles(dir)
+                    },
+                    label = { Text(chip) }
+                )
+            }
         }
+        
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (viewModel.currentPath.parentFile != null) {
+                IconButton(onClick = { viewModel.loadFiles(viewModel.currentPath.parentFile!!) }) {
+                    Text("←", fontSize = 24.sp)
+                }
+            }
+            Text(viewModel.currentPath.absolutePath, fontSize = 12.sp, modifier = Modifier.weight(1f))
+        }
+        
+        LazyColumn(Modifier.fillMaxSize()) {
+            items(filteredFiles) { item ->
+                val isSelected = viewModel.selectedFiles.contains(item.file)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            if (item.isDirectory) viewModel.loadFiles(item.file)
+                            else viewModel.toggleFileSelection(item.file)
+                        }
+                        .background(if (isSelected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        if (item.isDirectory) Icons.Default.Folder else Icons.Default.InsertDriveFile,
+                        contentDescription = null,
+                        tint = if (item.isDirectory) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(Modifier.width(16.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(item.name, color = MaterialTheme.colorScheme.onSurface)
+                        if (!item.isDirectory) {
+                            Text("${item.size / 1024} KB", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    if (!item.isDirectory) {
+                        Checkbox(checked = isSelected, onCheckedChange = { viewModel.toggleFileSelection(item.file) })
+                    }
+                }
+            }
+            item { Spacer(Modifier.height(80.dp)) } 
+        }
+    }
+}
+
+@Composable
+fun AppsTab(viewModel: MainViewModel) {
+    val filteredApps = viewModel.installedApps.filter { 
+        viewModel.appSearchQuery.isEmpty() || it.name.contains(viewModel.appSearchQuery, ignoreCase = true)
+    }
+    
+    Column(Modifier.fillMaxSize()) {
+        OutlinedTextField(
+            value = viewModel.appSearchQuery,
+            onValueChange = { viewModel.appSearchQuery = it },
+            placeholder = { Text("Search installed apps") },
+            leadingIcon = { Icon(Icons.Default.Search, null) },
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            singleLine = true
+        )
+        
+        LazyColumn(Modifier.fillMaxSize()) {
+            items(filteredApps) { app ->
+                val isSelected = viewModel.selectedApps.contains(app)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { viewModel.toggleAppSelection(app) }
+                        .background(if (isSelected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (app.icon != null) {
+                        Image(bitmap = app.icon.toBitmap().asImageBitmap(), contentDescription = null, modifier = Modifier.size(48.dp))
+                    } else {
+                        Icon(Icons.Default.Person, contentDescription = null, modifier = Modifier.size(48.dp))
+                    }
+                    Spacer(Modifier.width(16.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(app.name, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                        Text("${app.size / 1024 / 1024} MB", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Checkbox(checked = isSelected, onCheckedChange = { viewModel.toggleAppSelection(app) })
+                }
+            }
+            item { Spacer(Modifier.height(80.dp)) }
+        }
+    }
+}
+
+@Composable
+fun MeTab(viewModel: MainViewModel) {
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Text("Device Info", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.height(16.dp))
+        
+        OutlinedTextField(
+            value = viewModel.deviceName,
+            onValueChange = { viewModel.deviceName = it },
+            label = { Text("Device Name") },
+            modifier = Modifier.fillMaxWidth()
+        )
+        
+        Spacer(Modifier.height(16.dp))
+        
+        Text("Local IP: ${viewModel.localIp}", fontSize = 16.sp)
+        
+        Spacer(Modifier.height(16.dp))
+        
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("Discoverable to others")
+            Switch(
+                checked = viewModel.isVisible,
+                onCheckedChange = { viewModel.isVisible = it }
+            )
+        }
+        
+        Spacer(Modifier.height(32.dp))
+        
+        val successTransfers = TransferManager.transfers.collectAsState().value.filter { it.state == TransferState.SUCCESS }
+        Text("Transfer History", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.height(8.dp))
         
         LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
-            items(apps) { app ->
-                Row(Modifier.fillMaxWidth().clickable {
-                    val file = File(app.apkPath)
-                    startSendIntent(context, ip, port.toIntOrNull() ?: 9999, null, app.apkPath, "${app.name}.apk", file.length())
-                }.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Image(bitmap = app.icon.toBitmap().asImageBitmap(), contentDescription = null, modifier = Modifier.size(48.dp))
-                    Spacer(Modifier.width(16.dp))
-                    Column {
-                        Text(app.name, fontWeight = FontWeight.Bold)
-                        Text(app.packageName, fontSize = 12.sp)
+            items(successTransfers) { job ->
+                Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                    Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.InsertDriveFile, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(job.filename, modifier = Modifier.weight(1f))
+                        Icon(Icons.Default.Check, contentDescription = null, tint = Color(0xFF00C853))
                     }
                 }
-            }
-        }
-    }
-}
-
-@Composable
-fun ReceiverTab() {
-    val context = LocalContext.current
-    var port by remember { mutableStateOf("9999") }
-    val receiverState by TransferManager.receiverState.collectAsState()
-    val localIp = remember { getLocalIpAddress() }
-    
-    Column(Modifier.padding(16.dp)) {
-        Text("Your IP: $localIp", fontWeight = FontWeight.Bold, fontSize = 18.sp)
-        OutlinedTextField(value = port, onValueChange = { port = it }, label = { Text("Listen Port") }, modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
-        Spacer(Modifier.height(16.dp))
-        Button(onClick = {
-            val intent = Intent(context, TransferService::class.java).apply {
-                action = "START_RECEIVER"
-                putExtra("port", port.toIntOrNull() ?: 9999)
-            }
-            ContextCompat.startForegroundService(context, intent)
-        }, modifier = Modifier.fillMaxWidth()) {
-            Text("Start Receiver")
-        }
-        Button(onClick = {
-            val intent = Intent(context, TransferService::class.java).apply { action = "STOP_RECEIVER" }
-            context.startService(intent)
-        }, modifier = Modifier.fillMaxWidth()) {
-            Text("Stop Receiver")
-        }
-        Spacer(Modifier.height(16.dp))
-        Text("Receiver Status:")
-        TransferStatusCard(receiverState) {}
-    }
-}
-
-@Composable
-fun TransferStatusCard(state: TransferState, onResume: () -> Unit) {
-    if (state is TransferState.Idle) return
-    Card(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-        Column(Modifier.padding(16.dp)) {
-            when (state) {
-                is TransferState.Transferring -> {
-                    Text("Transferring: ${state.filename} " + if (state.isResume) "(Resuming)" else "")
-                    LinearProgressIndicator(progress = { state.progress }, modifier = Modifier.fillMaxWidth())
-                    Text(String.format("%.2f MB/s", state.speed))
-                }
-                is TransferState.Disconnected -> {
-                    Text("Disconnected: ${state.filename}")
-                    LinearProgressIndicator(progress = { state.progress }, modifier = Modifier.fillMaxWidth())
-                    Button(onClick = onResume, modifier = Modifier.fillMaxWidth()) {
-                        Text("Tap to Resume")
-                    }
-                }
-                is TransferState.Success -> {
-                    Text("Success: ${state.filename}", color = Color(0xFF00C853))
-                }
-                is TransferState.Error -> {
-                    Text("Error: ${state.message}", color = Color.Red)
-                }
-                else -> {}
             }
         }
     }
